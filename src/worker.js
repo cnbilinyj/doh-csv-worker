@@ -350,6 +350,14 @@ function buildLocalResponse(queryMsg, cfg){
     const rc = String(rule.rcode).toUpperCase();
     rcode = rc === "NXDOMAIN" ? 3 : rc === "SERVFAIL" ? 2 : rc === "REFUSED" ? 5 : 0;
     if (rcode === 3) authority.push({ name: q.qname, type: "SOA", ttl: 300, data: soaToString(defaultSoa) });
+  } else if (rule.records?.CNAME?.length) {
+    // CNAME 独占：不管客户端查什么类型，都只返回 CNAME
+    answers = rule.records.CNAME.map(rr => ({
+      name: q.qname,
+      type: "CNAME",
+      ttl: rr.ttl ?? DEFAULT_TTL,
+      data: rr.data
+    }));
   } else {
     const rrset = rule.records?.[TYPE_NAME[q.qtype]];
     if (rrset && rrset.length) {
@@ -443,113 +451,6 @@ async function routeResolve(queryBytes, route){
   throw new Error("unknown route proto: " + proto);
 }
 
-// WebUI 用的 JSON 测试接口（只展示本地规则，不真正转发上游）
-function jsonResolve(cfg, url){
-  const name=(url.searchParams.get("name")||"").toLowerCase();
-  const type=(url.searchParams.get("type")||"A").toUpperCase();
-  const resp={ Status:0, TC:false, RD:true, RA:true, AD:false, CD:false,
-    Question:[{name, type: TYPE[type]||1}], Answer: [] };
-
-  const rule=findRule(cfg,name);
-  if (!rule){ resp.Status=3; return resp; }
-  if (rule.rcode){
-    const rc=String(rule.rcode).toUpperCase();
-    resp.Status = rc==="NXDOMAIN"?3: rc==="SERVFAIL"?2: rc==="REFUSED"?5:0;
-    return resp;
-  }
-  if (rule.route){
-    resp.Answer.push({ name, type: 16, TTL: 0, data: JSON.stringify({ routed: rule.route }) });
-    return resp;
-  }
-  const rrset=rule.records?.[type];
-  if (!rrset) return resp;
-
-  for (const rr of rrset){
-    const ttl=rr.ttl ?? DEFAULT_TTL;
-    const data=rr.data;
-    if (type==="TXT"){
-      let arr;
-      const s=String(data);
-      if (s.trim().startsWith("[")) { try { arr=JSON.parse(s); } catch { arr=[s]; } }
-      else arr=[s];
-      resp.Answer.push({ name, type: TYPE.TXT, TTL: ttl, data: JSON.stringify(arr) });
-    } else if (type==="SRV" || type==="MX" || type==="CAA" || type==="SOA") {
-      resp.Answer.push({ name, type: TYPE[type], TTL: ttl, data: JSON.stringify(data) });
-    } else {
-      resp.Answer.push({ name, type: TYPE[type], TTL: ttl, data: String(data) });
-    }
-  }
-  return resp;
-}
-
-// 简单 WebUI 页面
-function htmlPage(cfg, env){
-  const configUrl = env.CONFIG_URL || "";
-  const rulesCount = Object.keys(cfg?.rules || {}).length;
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DoH CSV Admin</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;}
-    textarea{width:100%;height:260px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
-    input{width:100%;padding:8px;margin:6px 0;}
-    button{padding:8px 12px;}
-    pre{background:#f6f8fa;padding:12px;overflow:auto;}
-    .row{display:flex;gap:8px;flex-wrap:wrap;}
-    .card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0;}
-    code{background:#eee;padding:2px 4px;border-radius:4px;}
-  </style>
-</head>
-<body>
-  <h2>DoH CSV Admin</h2>
-  <div class="card">
-    <div><b>DoH endpoint:</b> <code>/dns-query</code></div>
-    <div><b>Config URL:</b> <code>${configUrl || "(none)"}</code></div>
-    <div><b>Rules loaded:</b> ${rulesCount}</div>
-    <div><b>Default upstream:</b> Cloudflare DoH</div>
-  </div>
-
-  <div class="card">
-    <h3>Test lookup (local rules only)</h3>
-    <div class="row">
-      <input id="name" placeholder="example.com." />
-      <input id="type" placeholder="A" style="max-width:120px" />
-      <button onclick="test()">Query</button>
-    </div>
-    <pre id="out"></pre>
-  </div>
-
-  <div class="card">
-    <h3>CSV format</h3>
-    <pre>name,type,ttl,data,rcode
-example.com.,A,300,1.2.3.4,
-example.com.,TXT,300,"[\"v=spf1 -all\",\"hello=world\"]",
-notfound.example.com.,,,,NXDOMAIN
-
-google.com.,DOH,,https://dns.google/dns-query,ROUTE
-openai.com.,UDP,,1.1.1.1,ROUTE</pre>
-  </div>
-
-<script>
-  async function test(){
-    const name=document.getElementById("name").value.trim();
-    const type=(document.getElementById("type").value.trim()||"A").toUpperCase();
-    const out=document.getElementById("out");
-    out.textContent="Loading...";
-    try{
-      const res=await fetch("/resolve?name="+encodeURIComponent(name)+"&type="+encodeURIComponent(type));
-      const data=await res.json();
-      out.textContent=JSON.stringify(data,null,2);
-    }catch(e){ out.textContent="Error: "+e.message; }
-  }
-</script>
-</body>
-</html>`;
-}
-
 // 构造一个 SERVFAIL 响应（用于上游失败兜底）
 function buildLocalServfail(queryMsg){
   const q = parseDnsQuery(queryMsg);
@@ -571,24 +472,24 @@ function buildLocalServfail(queryMsg){
 
 export default {
   async fetch(request, env, ctx){
-    const url=new URL(request.url);
-    const cfg=await loadConfig(env);
+    const url = new URL(request.url);
 
-    if (request.method==="GET" && url.pathname==="/"){
-      if (String(env.ENABLE_WEBUI||"true")==="false") return new Response("Not found",{status:404});
-      return new Response(htmlPage(cfg, env), { headers:{ "content-type":"text/html; charset=utf-8" }});
+    // 根目录永久重定向到标准 DoH 接口
+    if (url.pathname === "/") {
+      return Response.redirect(new URL("/dns-query", url.origin).toString(), 308);
     }
 
-    if (request.method==="GET" && url.pathname==="/resolve"){
-      return new Response(JSON.stringify(jsonResolve(cfg,url),null,2), {
-        headers:{ "content-type":"application/json; charset=utf-8" }
-      });
+    // 只保留标准 DoH 接口
+    if (url.pathname !== "/dns-query") {
+      return new Response("Not found", { status: 404 });
     }
 
-    if (request.method==="GET" && url.pathname==="/dns-query"){
-      const b64=url.searchParams.get("dns");
-      if (!b64) return new Response("missing dns param",{status:400});
-      const query=b64uToBytes(b64);
+    const cfg = await loadConfig(env);
+
+    if (request.method === "GET" && url.pathname === "/dns-query"){
+      const b64 = url.searchParams.get("dns");
+      if (!b64) return new Response("missing dns param", { status: 400 });
+      const query = b64uToBytes(b64);
 
       const q = parseDnsQuery(query);
       const rule = findRule(cfg, q.qname);
@@ -611,10 +512,10 @@ export default {
       }
     }
 
-    if (request.method==="POST" && url.pathname==="/dns-query"){
-      const ct=request.headers.get("content-type")||"";
-      if (!ct.includes("application/dns-message")) return new Response("unsupported content-type",{status:415});
-      const query=new Uint8Array(await request.arrayBuffer());
+    if (request.method === "POST" && url.pathname === "/dns-query"){
+      const ct = request.headers.get("content-type") || "";
+      if (!ct.includes("application/dns-message")) return new Response("unsupported content-type", { status: 415 });
+      const query = new Uint8Array(await request.arrayBuffer());
 
       const q = parseDnsQuery(query);
       const rule = findRule(cfg, q.qname);
@@ -637,6 +538,6 @@ export default {
       }
     }
 
-    return new Response("Not found",{status:404});
+    return new Response("Not found", { status: 404 });
   }
 };
